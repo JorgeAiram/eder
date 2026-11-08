@@ -14,6 +14,9 @@ class HealthTest extends TestCase
      */
     public function test_health_check_returns_healthy_status(): void
     {
+        // Fallo intencional para demostrar el bloqueo del pipeline en Pull Request
+        $this->fail('Fallo intencional: demostracion de bloqueo de CI ante prueba fallida.');
+
         $response = $this->getJson('/health');
 
         $response->assertStatus(200)
