@@ -13,6 +13,10 @@ backups/
 *.sql
 screenshots/
 *.pdf
+*.log
+generate_*.py
+inspect_actions.py
+take_github_screenshots.py
 Homestead.json
 Homestead.yaml
 auth.json
