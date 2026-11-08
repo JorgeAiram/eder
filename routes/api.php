@@ -4,6 +4,7 @@ use App\Http\Controllers\HealthController;
 use App\Http\Controllers\ProductController;
 use Illuminate\Support\Facades\Route;
 
+// Rutas verificadas por pipeline CI
 Route::get('/health', [HealthController::class, 'check']);
 
 Route::get('/products', [ProductController::class, 'index']);
