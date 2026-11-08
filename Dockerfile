@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for Laravel Backend (Production Ready)
-FROM php:8.2-fpm-alpine AS base
+FROM php:8.4-fpm-alpine AS base
 
 # Install system dependencies
 RUN apk add --no-cache \
@@ -33,7 +33,8 @@ WORKDIR /var/www/html
 COPY . /var/www/html
 
 # Install Composer dependencies (production optimized)
-RUN composer install --no-dev --optimize-autoloader --no-interaction
+RUN git config --global --add safe.directory /var/www/html && \
+    composer install --no-dev --optimize-autoloader --no-interaction --ignore-platform-reqs
 
 # Permissions for storage and cache
 RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache \
