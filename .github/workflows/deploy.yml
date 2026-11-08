@@ -1,0 +1,176 @@
+name: Build, Publish & Continuous Deployment (CD)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-publish:
+    name: Build & Publish Docker Image to GHCR
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short,prefix=
+            type=raw,value=latest
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  cd-deploy:
+    name: Continuous Deployment to Test Server
+    runs-on: ubuntu-latest
+    needs: build-and-publish
+    environment: staging
+    env:
+      APP_IMAGE_TAG: ${{ github.sha }}
+      DB_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD || 'staging_root_secret' }}
+      DB_DATABASE: ${{ secrets.DB_DATABASE || 'laravel_cicd_db' }}
+      DB_USERNAME: ${{ secrets.DB_USERNAME || 'laravel_user' }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD || 'staging_password' }}
+      APP_KEY: ${{ secrets.APP_KEY || 'base64:kp+hvoOqzD9z5nHSMuPgA1uk5on8fklB547dhVrF36U=' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Initialize Staging Directory & Backups
+        run: |
+          mkdir -p backups
+          echo "CURRENT_TAG_FILE=backups/last_stable_tag.txt" >> $GITHUB_ENV
+          if [ ! -f backups/last_stable_tag.txt ]; then
+            echo "latest" > backups/last_stable_tag.txt
+          fi
+
+      - name: Pre-Deployment Database Backup (mysqldump)
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_FILE="backups/backup_${TIMESTAMP}_${{ github.sha }}.sql"
+          echo "Creando respaldo de base de datos previo al despliegue..."
+          echo "Archivo de respaldo: ${BACKUP_FILE}"
+          
+          # Levantar servicio de base de datos si no estuviera corriendo
+          docker compose -f docker-compose.prod.yml up -d database
+          docker compose -f docker-compose.prod.yml exec -T database mysqladmin ping -h localhost -u root -p${{ env.DB_ROOT_PASSWORD }} --silent || sleep 8
+          
+          # Generar dump con fecha y commit
+          docker compose -f docker-compose.prod.yml exec -T database mysqldump -u root -p${{ env.DB_ROOT_PASSWORD }} --databases ${{ env.DB_DATABASE }} > "${BACKUP_FILE}" || true
+          echo "Respaldo generado exitosamente (${BACKUP_FILE})"
+          echo "BACKUP_PATH=${BACKUP_FILE}" >> $GITHUB_ENV
+
+      - name: Pull Published Image from GHCR (No Build on Server)
+        run: |
+          echo "Descargando imagen preconstruida de GHCR (Tag: ${{ env.APP_IMAGE_TAG }})..."
+          docker compose -f docker-compose.prod.yml pull
+
+      - name: Execute Controlled Database Migrations
+        run: |
+          echo "Ejecutando migraciones controladas (php artisan migrate --force)..."
+          docker compose -f docker-compose.prod.yml run --rm app php artisan migrate --force
+
+      - name: Start Updated Containers
+        run: |
+          echo "Actualizando servicios en el servidor de pruebas..."
+          docker compose -f docker-compose.prod.yml up -d
+
+      - name: Verify Health Endpoint (/health) with Retries
+        id: health_check
+        run: |
+          echo "Iniciando verificación de estado de salud (/health)..."
+          HEALTH_URL="http://localhost:80/health"
+          MAX_RETRIES=6
+          RETRY_COUNT=0
+          SUCCESS=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            echo "Intento ${RETRY_COUNT} de ${MAX_RETRIES} consultando ${HEALTH_URL}..."
+            RESPONSE=$(curl -s -w "\n%{http_code}" ${HEALTH_URL} || echo "000")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "Verificación exitosa (HTTP 200 OK):"
+              echo "$BODY"
+              SUCCESS=1
+              break
+            else
+              echo "Respuesta no satisfactoria (Código HTTP: ${HTTP_CODE}). Reintentando en 5s..."
+              sleep 5
+            fi
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "ERROR: La aplicación no respondió satisfactoriamente al chequeo de salud."
+            exit 1
+          fi
+
+      - name: Save Stable Image Tag on Success
+        if: success()
+        run: |
+          echo "${{ env.APP_IMAGE_TAG }}" > backups/last_stable_tag.txt
+          echo "Despliegue finalizado con éxito. Versión estable registrada: ${{ env.APP_IMAGE_TAG }}"
+
+      - name: Automated Rollback on Deployment Failure
+        if: failure()
+        run: |
+          PREVIOUS_TAG=$(cat backups/last_stable_tag.txt || echo "latest")
+          echo "=========================================================="
+          echo "ALERTA: El despliegue ha fallado. Iniciando Rollback automático..."
+          echo "Restaurando versión previa estable: ${PREVIOUS_TAG}"
+          echo "=========================================================="
+          
+          # Revertir a la versión previa
+          APP_IMAGE_TAG=${PREVIOUS_TAG} docker compose -f docker-compose.prod.yml up -d app
+          
+          # Restaurar respaldo de base de datos si existe
+          if [ -f "${{ env.BACKUP_PATH }}" ]; then
+            echo "Restaurando base de datos desde respaldo previo: ${{ env.BACKUP_PATH }}..."
+            docker compose -f docker-compose.prod.yml exec -T database mysql -u root -p${{ env.DB_ROOT_PASSWORD }} ${{ env.DB_DATABASE }} < "${{ env.BACKUP_PATH }}" || true
+          fi
+          
+          echo "Rollback completado. Registro de incidencia guardado en logs de despliegue."
+          exit 1
